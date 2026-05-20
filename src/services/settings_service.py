@@ -100,6 +100,10 @@ class SettingsService:
                         litellm_params TEXT DEFAULT '{}',
                         timeout INTEGER DEFAULT 90,
                         bypass_proxy BOOLEAN DEFAULT 0,
+                        aws_region TEXT DEFAULT '',
+                        aws_profile TEXT DEFAULT '',
+                        aws_access_key_id TEXT DEFAULT '',
+                        aws_secret_access_key TEXT DEFAULT '',
                         is_active BOOLEAN DEFAULT 0,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -554,26 +558,16 @@ class SettingsService:
                 cursor = conn.cursor()
 
                 cursor.execute('''
-                    SELECT id, name, model, url, max_tokens, api_key, disable_tls, provider_type, reasoning_effort, timeout, bypass_proxy
+                    SELECT id, name, model, url, max_tokens, api_key, disable_tls,
+                           provider_type, reasoning_effort, timeout, bypass_proxy,
+                           aws_region, aws_profile, aws_access_key_id, aws_secret_access_key
                     FROM llm_providers WHERE is_active = 1 LIMIT 1
                 ''')
 
                 row = cursor.fetchone()
                 if row:
                     log.log_debug(f"Found active provider in database: {row[1]}")
-                    return {
-                        'id': row[0],
-                        'name': row[1],
-                        'model': row[2],
-                        'url': row[3],
-                        'max_tokens': row[4],
-                        'api_key': row[5],
-                        'disable_tls': bool(row[6]),
-                        'provider_type': row[7],
-                        'reasoning_effort': row[8] if len(row) > 8 else 'none',
-                        'timeout': row[9] if len(row) > 9 else DEFAULT_PROVIDER_TIMEOUT_SECONDS,
-                        'bypass_proxy': bool(row[10]) if len(row) > 10 else False
-                    }
+                    return self._llm_provider_row_to_dict(row)
 
                 log.log_debug("No active provider in database, checking saved setting")
 
@@ -587,7 +581,9 @@ class SettingsService:
                     log.log_debug(f"Found saved active provider setting: {saved_provider_name}")
 
                     cursor.execute('''
-                        SELECT id, name, model, url, max_tokens, api_key, disable_tls, provider_type, reasoning_effort, timeout, bypass_proxy
+                        SELECT id, name, model, url, max_tokens, api_key, disable_tls,
+                               provider_type, reasoning_effort, timeout, bypass_proxy,
+                               aws_region, aws_profile, aws_access_key_id, aws_secret_access_key
                         FROM llm_providers WHERE name = ? LIMIT 1
                     ''', (saved_provider_name,))
 
@@ -597,19 +593,7 @@ class SettingsService:
                         cursor.execute('UPDATE llm_providers SET is_active = 1 WHERE name = ?', (saved_provider_name,))
                         conn.commit()
 
-                        return {
-                            'id': provider_row[0],
-                            'name': provider_row[1],
-                            'model': provider_row[2],
-                            'url': provider_row[3],
-                            'max_tokens': provider_row[4],
-                            'api_key': provider_row[5],
-                            'disable_tls': bool(provider_row[6]),
-                            'provider_type': provider_row[7],
-                            'reasoning_effort': provider_row[8] if len(provider_row) > 8 else 'none',
-                            'timeout': provider_row[9] if len(provider_row) > 9 else DEFAULT_PROVIDER_TIMEOUT_SECONDS,
-                            'bypass_proxy': bool(provider_row[10]) if len(provider_row) > 10 else False
-                        }
+                        return self._llm_provider_row_to_dict(provider_row)
                     else:
                         log.log_warn(f"Saved provider '{saved_provider_name}' no longer exists in database")
                 else:
@@ -621,6 +605,27 @@ class SettingsService:
                 raise RuntimeError(f"Failed to get active LLM provider: {e}")
             finally:
                 conn.close()
+
+    @staticmethod
+    def _llm_provider_row_to_dict(row) -> Dict[str, Any]:
+        """Convert a provider row from get_active_llm_provider into a dict."""
+        return {
+            'id': row[0],
+            'name': row[1],
+            'model': row[2],
+            'url': row[3],
+            'max_tokens': row[4],
+            'api_key': row[5],
+            'disable_tls': bool(row[6]),
+            'provider_type': row[7],
+            'reasoning_effort': row[8] if len(row) > 8 else 'none',
+            'timeout': row[9] if len(row) > 9 else DEFAULT_PROVIDER_TIMEOUT_SECONDS,
+            'bypass_proxy': bool(row[10]) if len(row) > 10 else False,
+            'aws_region': row[11] if len(row) > 11 else '',
+            'aws_profile': row[12] if len(row) > 12 else '',
+            'aws_access_key_id': row[13] if len(row) > 13 else '',
+            'aws_secret_access_key': row[14] if len(row) > 14 else '',
+        }
 
     # MCP Provider Operations
 

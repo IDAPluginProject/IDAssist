@@ -81,6 +81,20 @@ def validate_provider_test_config(provider_config):
     return None
 
 
+def provider_requires_url(provider_type_value):
+    """Check whether a provider type requires a URL in settings."""
+    try:
+        provider_type = ProviderType(provider_type_value)
+    except ValueError:
+        return True
+
+    return (
+        provider_type != ProviderType.ANTHROPIC_CLI and
+        provider_type != ProviderType.BEDROCK and
+        not ProviderType.uses_oauth(provider_type)
+    )
+
+
 def get_provider_timeout_seconds(provider_config):
     """Get the configured provider timeout as a positive float."""
     try:
@@ -121,7 +135,9 @@ def validate_provider_model_fetch_config(provider_config):
     except ValueError:
         return f"Provider '{provider_name}' has an invalid provider type: {provider_type_value}"
 
-    if supports_live_model_discovery(provider_type) and not provider_config.get('url', '').strip():
+    if (provider_type != ProviderType.BEDROCK and
+            supports_live_model_discovery(provider_type) and
+            not provider_config.get('url', '').strip()):
         return f"Provider '{provider_name}' has no URL configured."
 
     if ProviderType.requires_api_key(provider_type) and not provider_config.get('api_key', '').strip():
@@ -577,7 +593,7 @@ class ProviderDialog(QDialog):
         # AWS Bedrock config
         self.bedrock_note_label = QLabel(
             "Uses AWS credentials via boto3 credential chain (env vars, ~/.aws/credentials, IAM role).\n"
-            "See: https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html"
+            "Or enter AWS Access Key ID and Secret Access Key below."
         )
         self.bedrock_note_label.setStyleSheet("color: #666; font-style: italic; margin-top: 10px;")
         self.bedrock_note_label.setWordWrap(True)
@@ -699,9 +715,14 @@ class ProviderDialog(QDialog):
 
     def get_provider_data(self):
         """Get the provider data from the form"""
+        provider_type = self.provider_type_combo.currentData()
+        aws_region = self.aws_region_edit.text().strip()
+        if provider_type == ProviderType.BEDROCK.value and not aws_region:
+            aws_region = 'us-east-1'
+
         return {
             'name': self.name_edit.text().strip(),
-            'provider_type': self.provider_type_combo.currentData(),
+            'provider_type': provider_type,
             'model': self._get_current_model_text(),
             'url': self.url_edit.text().strip(),
             'max_tokens': self.max_tokens_spin.value(),
@@ -709,7 +730,7 @@ class ProviderDialog(QDialog):
             'api_key': self.key_edit.text(),
             'disable_tls': self.disable_tls_check.isChecked(),
             'bypass_proxy': self.bypass_proxy_check.isChecked(),
-            'aws_region': self.aws_region_edit.text().strip(),
+            'aws_region': aws_region,
             'aws_profile': self.aws_profile_edit.text().strip(),
             'aws_access_key_id': self.aws_access_key_edit.text(),
             'aws_secret_access_key': self.aws_secret_key_edit.text(),
@@ -906,6 +927,8 @@ class ProviderDialog(QDialog):
                 self.aws_access_key_edit.setVisible(is_bedrock)
                 self.aws_secret_key_label.setVisible(is_bedrock)
                 self.aws_secret_key_edit.setVisible(is_bedrock)
+                if is_bedrock and not self.aws_region_edit.text().strip():
+                    self.aws_region_edit.setText('us-east-1')
 
                 is_claude_code = provider_type == ProviderType.ANTHROPIC_CLI
                 self.claude_code_note_label.setVisible(is_claude_code)
@@ -915,6 +938,8 @@ class ProviderDialog(QDialog):
                 is_oauth = is_codex_oauth or is_gemini_oauth
                 self.authenticate_button.setVisible(is_oauth)
                 self.oauth_note_label.setVisible(is_oauth)
+                self.api_key_label.setVisible(not is_bedrock)
+                self.key_edit.setVisible(not is_bedrock)
 
                 if is_codex_oauth:
                     self.api_key_label.setText("OAuth Token (JSON):")
@@ -1644,11 +1669,10 @@ class SettingsController(QObject):
         if exec_dialog(dialog) == QDialog.Accepted:
             try:
                 data = dialog.get_provider_data()
-                is_cli_provider = data.get('provider_type') == 'anthropic_cli'
                 if not data['name'] or not data['model']:
                     self.show_error("Validation Error", "Name and Model are required fields.")
                     return
-                if not is_cli_provider and not data['url']:
+                if provider_requires_url(data.get('provider_type')) and not data['url']:
                     self.show_error("Validation Error", "URL is required for this provider type.")
                     return
 
@@ -1656,7 +1680,11 @@ class SettingsController(QObject):
                     data['name'], data['model'], data['url'],
                     data['max_tokens'], data['api_key'], data['disable_tls'], data['provider_type'],
                     bypass_proxy=data.get('bypass_proxy', False),
-                    timeout=data.get('timeout', int(DEFAULT_PROVIDER_TIMEOUT_SECONDS))
+                    timeout=data.get('timeout', int(DEFAULT_PROVIDER_TIMEOUT_SECONDS)),
+                    aws_region=data.get('aws_region', ''),
+                    aws_profile=data.get('aws_profile', ''),
+                    aws_access_key_id=data.get('aws_access_key_id', ''),
+                    aws_secret_access_key=data.get('aws_secret_access_key', '')
                 )
                 self._invalidate_llm_provider_cache(data['name'])
 
@@ -1684,11 +1712,10 @@ class SettingsController(QObject):
 
             if exec_dialog(dialog) == QDialog.Accepted:
                 data = dialog.get_provider_data()
-                is_cli_provider = data.get('provider_type') == 'anthropic_cli'
                 if not data['name'] or not data['model']:
                     self.show_error("Validation Error", "Name and Model are required fields.")
                     return
-                if not is_cli_provider and not data['url']:
+                if provider_requires_url(data.get('provider_type')) and not data['url']:
                     self.show_error("Validation Error", "URL is required for this provider type.")
                     return
 
@@ -1717,7 +1744,11 @@ class SettingsController(QObject):
                 provider['max_tokens'], provider['api_key'],
                 provider['disable_tls'], provider.get('provider_type', 'openai_platform'),
                 bypass_proxy=provider.get('bypass_proxy', False),
-                timeout=provider.get('timeout', int(DEFAULT_PROVIDER_TIMEOUT_SECONDS))
+                timeout=provider.get('timeout', int(DEFAULT_PROVIDER_TIMEOUT_SECONDS)),
+                aws_region=provider.get('aws_region', ''),
+                aws_profile=provider.get('aws_profile', ''),
+                aws_access_key_id=provider.get('aws_access_key_id', ''),
+                aws_secret_access_key=provider.get('aws_secret_access_key', '')
             )
             self._invalidate_llm_provider_cache(new_name)
             self.load_initial_data()

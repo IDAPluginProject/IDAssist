@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch, PropertyMock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.services.models.llm_models import (
-    ChatRequest, ChatMessage, MessageRole, Usage
+    ChatRequest, ChatMessage, MessageRole, ToolCall, Usage
 )
 from src.services.models.provider_types import ProviderType
 
@@ -150,6 +150,31 @@ class TestBedrockProviderChat(unittest.TestCase):
         self.assertIn('system', call_kwargs)
         self.assertEqual(call_kwargs['system'][0]['text'], "You are a helpful assistant.")
 
+    def test_prepare_tool_result_uses_user_role(self):
+        """Tool-result continuation is sent as a Bedrock user message."""
+        provider = self._create_provider()
+        messages, _ = provider._prepare_messages([
+            ChatMessage(
+                role=MessageRole.ASSISTANT,
+                content="",
+                tool_calls=[ToolCall(id="tool-1", name="lookup", arguments={"q": "x"})],
+            ),
+            ChatMessage(
+                role=MessageRole.TOOL,
+                content="result text",
+                tool_call_id="tool-1",
+            ),
+        ])
+
+        self.assertEqual(messages[0]['role'], 'assistant')
+        self.assertIn('toolUse', messages[0]['content'][0])
+        self.assertEqual(messages[1]['role'], 'user')
+        self.assertIn('toolResult', messages[1]['content'][0])
+        self.assertEqual(
+            messages[1]['content'][0]['toolResult']['content'][0]['text'],
+            'result text',
+        )
+
     @patch(BEDROCK_MODULE + '.boto3')
     def test_chat_completion_stream_yields_chunks(self, mock_boto3):
         """Stream returns content chunks and final metadata."""
@@ -184,6 +209,52 @@ class TestBedrockProviderChat(unittest.TestCase):
         self.assertEqual(final_chunks[0].usage.total_tokens, 15)
 
     @patch(BEDROCK_MODULE + '.boto3')
+    def test_chat_completion_stream_accumulates_tool_input(self, mock_boto3):
+        """Streamed tool-use input chunks are parsed into final tool calls."""
+        import asyncio
+
+        mock_client = MagicMock()
+        mock_client.converse_stream.return_value = {
+            'stream': [
+                {'messageStart': {'role': 'assistant', 'messageId': 'msg-1'}},
+                {'contentBlockStart': {
+                    'contentBlockIndex': 0,
+                    'start': {'toolUse': {'toolUseId': 'tool-1', 'name': 'lookup'}}
+                }},
+                {'contentBlockDelta': {
+                    'contentBlockIndex': 0,
+                    'delta': {'toolUse': {'input': '{"symbol":'}}
+                }},
+                {'contentBlockDelta': {
+                    'contentBlockIndex': 0,
+                    'delta': {'toolUse': {'input': '"main"}'}}
+                }},
+                {'contentBlockStop': {'contentBlockIndex': 0}},
+                {'messageStop': {'stopReason': 'tool_use'}},
+                {'metadata': {'usage': {'inputTokens': 10, 'outputTokens': 5}}},
+            ]
+        }
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_client
+        mock_boto3.Session.return_value = mock_session
+
+        provider = self._create_provider()
+        request = self._make_request()
+
+        async def consume():
+            chunks = []
+            async for chunk in provider.chat_completion_stream(request):
+                chunks.append(chunk)
+            return chunks
+
+        chunks = asyncio.run(consume())
+        final = [c for c in chunks if not c.is_streaming][0]
+        self.assertEqual(final.finish_reason, 'tool_calls')
+        self.assertEqual(final.tool_calls[0].id, 'tool-1')
+        self.assertEqual(final.tool_calls[0].name, 'lookup')
+        self.assertEqual(final.tool_calls[0].arguments, {'symbol': 'main'})
+
+    @patch(BEDROCK_MODULE + '.boto3')
     def test_test_connection_success(self, mock_boto3):
         """test_connection returns True when Bedrock API responds."""
         import asyncio
@@ -214,6 +285,64 @@ class TestBedrockProviderChat(unittest.TestCase):
         provider = self._create_provider()
         result = asyncio.run(provider.test_connection())
         self.assertFalse(result)
+
+    @patch(BEDROCK_MODULE + '.boto3')
+    def test_no_credentials_maps_to_authentication_error(self, mock_boto3):
+        """Missing AWS credentials produce an actionable auth error."""
+        import asyncio
+        from botocore.exceptions import NoCredentialsError
+        from src.services.llm_providers.base_provider import AuthenticationError
+
+        mock_client = MagicMock()
+        mock_client.converse.side_effect = NoCredentialsError()
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_client
+        mock_boto3.Session.return_value = mock_session
+
+        provider = self._create_provider()
+        request = self._make_request()
+
+        with self.assertRaises(AuthenticationError) as cm:
+            asyncio.run(provider.chat_completion(request))
+        self.assertIn("AWS credentials were not found", str(cm.exception))
+        self.assertIn("AWS Access Key ID", str(cm.exception))
+
+    def test_partial_explicit_credentials_are_rejected(self):
+        """Explicit AWS credentials must include both key ID and secret."""
+        from src.services.llm_providers.bedrock_provider import BedrockProvider
+
+        config = dict(self.config)
+        config['aws_access_key_id'] = 'AKIA123'
+        config['aws_secret_access_key'] = ''
+
+        with self.assertRaises(ValueError):
+            BedrockProvider(config)
+
+    @patch(BEDROCK_MODULE + '.boto3')
+    def test_discover_available_models(self, mock_boto3):
+        """discover_available_models returns Bedrock text model IDs."""
+        import asyncio
+
+        mock_client = MagicMock()
+        mock_client.list_foundation_models.return_value = {
+            'modelSummaries': [
+                {'modelId': 'amazon.nova-pro-v1:0', 'outputModalities': ['TEXT']},
+                {'modelId': 'anthropic.claude-sonnet-4-6', 'outputModalities': ['TEXT']},
+                {'modelId': 'image-only', 'outputModalities': ['IMAGE']},
+            ]
+        }
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_client
+        mock_boto3.Session.return_value = mock_session
+
+        provider = self._create_provider()
+        result = asyncio.run(provider.discover_available_models())
+        self.assertTrue(result.success)
+        self.assertEqual(
+            result.models,
+            ['amazon.nova-pro-v1:0', 'anthropic.claude-sonnet-4-6'],
+        )
+        self.assertEqual(result.source_label, 'AWS Bedrock us-east-1')
 
     @patch(BEDROCK_MODULE + '.boto3')
     def test_authentication_error(self, mock_boto3):

@@ -3,12 +3,14 @@
 """Bedrock Provider - Implementation for AWS Bedrock Converse API."""
 
 import json
-import time
 from typing import List, Dict, Any, AsyncGenerator, Optional, Callable
 
 try:
     import boto3
-    from botocore.exceptions import ClientError, BotoCoreError
+    from botocore.exceptions import (
+        ClientError, BotoCoreError, NoCredentialsError,
+        PartialCredentialsError, ProfileNotFound
+    )
 except ImportError:
     raise ImportError("boto3 package not available. Install with: pip install boto3")
 
@@ -22,7 +24,6 @@ from ..models.llm_models import (
     ProviderModelDiscoveryResult
 )
 from ..models.provider_types import ProviderType
-from ..models.reasoning_models import ReasoningConfig
 
 from src.ida_compat import log
 
@@ -58,9 +59,23 @@ class BedrockProvider(BaseLLMProvider):
             raise ValueError("Model is required")
         if not self.aws_region:
             raise ValueError("AWS region is required")
+        if bool(self.aws_access_key_id) != bool(self.aws_secret_access_key):
+            raise ValueError(
+                "AWS Access Key ID and AWS Secret Access Key must both be set, "
+                "or both left blank to use the boto3 credential chain"
+            )
 
-    def _create_client(self):
-        """Create a boto3 bedrock-runtime client.
+    @staticmethod
+    def _credentials_error_message(error: Exception) -> str:
+        """Return a user-facing AWS credential configuration error."""
+        return (
+            "AWS credentials were not found for Bedrock. Configure an AWS Profile, "
+            "enter both AWS Access Key ID and AWS Secret Access Key, or configure "
+            f"the standard AWS credential chain. Details: {error}"
+        )
+
+    def _create_client(self, service_name: str = 'bedrock-runtime'):
+        """Create a boto3 Bedrock client.
 
         Uses the configured credential chain: explicit keys take precedence,
         then named profile, then default boto3 chain.
@@ -78,7 +93,7 @@ class BedrockProvider(BaseLLMProvider):
             client_kwargs['aws_access_key_id'] = self.aws_access_key_id
             client_kwargs['aws_secret_access_key'] = self.aws_secret_access_key
 
-        return session.client('bedrock-runtime', **client_kwargs)
+        return session.client(service_name, **client_kwargs)
 
     @staticmethod
     def _prepare_messages(messages: List[ChatMessage]):
@@ -97,9 +112,23 @@ class BedrockProvider(BaseLLMProvider):
                     system_content = [{"text": msg.content}]
                 continue
 
+            content_blocks = []
+
+            if msg.role == MessageRole.TOOL or msg.tool_call_id:
+                content_blocks.append({
+                    "toolResult": {
+                        "toolUseId": msg.tool_call_id,
+                        "content": [{"text": msg.content or ""}]
+                    }
+                })
+                converse_messages.append({
+                    "role": "user",
+                    "content": content_blocks
+                })
+                continue
+
             role = "user" if msg.role == MessageRole.USER else "assistant"
 
-            content_blocks = []
             if msg.content:
                 content_blocks.append({"text": msg.content})
 
@@ -112,14 +141,6 @@ class BedrockProvider(BaseLLMProvider):
                             "input": tc.arguments
                         }
                     })
-
-            if msg.tool_call_id:
-                content_blocks.append({
-                    "toolResult": {
-                        "toolUseId": msg.tool_call_id,
-                        "content": [{"text": msg.content or ""}]
-                    }
-                })
 
             converse_messages.append({
                 "role": role,
@@ -296,6 +317,8 @@ class BedrockProvider(BaseLLMProvider):
             raise APIProviderError(
                 f"AWS Bedrock API error ({error_code}): {error_message}"
             )
+        except (NoCredentialsError, PartialCredentialsError, ProfileNotFound) as e:
+            raise AuthenticationError(self._credentials_error_message(e))
         except BotoCoreError as e:
             raise NetworkError(f"AWS SDK error: {e}")
         except Exception as e:
@@ -327,6 +350,8 @@ class BedrockProvider(BaseLLMProvider):
         """Internal implementation of streaming via ConverseStream API."""
         accumulated_content = ""
         accumulated_tool_calls = []
+        tool_calls_by_index = {}
+        tool_input_buffers = {}
         response_id = None
         response_model = self.model
         input_token_count = 0
@@ -377,7 +402,13 @@ class BedrockProvider(BaseLLMProvider):
                         )
 
                     elif 'toolUse' in delta_obj:
-                        pass
+                        index = delta.get('contentBlockIndex')
+                        if index is not None:
+                            tool_delta = delta_obj['toolUse']
+                            tool_input_buffers[index] = (
+                                tool_input_buffers.get(index, '') +
+                                tool_delta.get('input', '')
+                            )
 
                 elif event_type == 'contentBlockStart':
                     start = event['contentBlockStart']
@@ -391,6 +422,17 @@ class BedrockProvider(BaseLLMProvider):
                             arguments={}
                         )
                         accumulated_tool_calls.append(current_tool)
+                        index = start.get('contentBlockIndex')
+                        if index is not None:
+                            tool_calls_by_index[index] = current_tool
+
+                elif event_type == 'contentBlockStop':
+                    stop = event['contentBlockStop']
+                    index = stop.get('contentBlockIndex')
+                    if index in tool_calls_by_index:
+                        tool_calls_by_index[index].arguments = self._parse_tool_input(
+                            tool_input_buffers.get(index, '')
+                        )
 
                 elif event_type == 'messageStop':
                     stop_data = event['messageStop']
@@ -441,6 +483,8 @@ class BedrockProvider(BaseLLMProvider):
             raise APIProviderError(
                 f"AWS Bedrock API error ({error_code}): {error_message}"
             )
+        except (NoCredentialsError, PartialCredentialsError, ProfileNotFound) as e:
+            raise AuthenticationError(self._credentials_error_message(e))
         except BotoCoreError as e:
             raise NetworkError(f"AWS SDK error: {e}")
         except Exception as e:
@@ -460,20 +504,23 @@ class BedrockProvider(BaseLLMProvider):
             "Use LiteLLM provider with Titan embedding models."
         )
 
+    @staticmethod
+    def _parse_tool_input(raw_input: str) -> Dict[str, Any]:
+        """Parse streamed tool input JSON into a dict."""
+        if not raw_input:
+            return {}
+        try:
+            parsed = json.loads(raw_input)
+            if isinstance(parsed, dict):
+                return parsed
+            return {"input": parsed}
+        except json.JSONDecodeError:
+            return {"input": raw_input}
+
     async def test_connection(self) -> bool:
         """Test connectivity by listing available foundation models."""
         try:
-            session_kwargs = {}
-            if self.aws_profile:
-                session_kwargs['profile_name'] = self.aws_profile
-
-            session = boto3.Session(**session_kwargs)
-            client_kwargs = {'region_name': self.aws_region}
-            if self.aws_access_key_id and self.aws_secret_access_key:
-                client_kwargs['aws_access_key_id'] = self.aws_access_key_id
-                client_kwargs['aws_secret_access_key'] = self.aws_secret_access_key
-
-            client = session.client('bedrock', **client_kwargs)
+            client = self._create_client('bedrock')
 
             response = client.list_foundation_models(
                 byInferenceType='ON_DEMAND'
@@ -493,12 +540,62 @@ class BedrockProvider(BaseLLMProvider):
                 f"{e.response['Error']['Message']}"
             )
             return False
+        except (NoCredentialsError, PartialCredentialsError, ProfileNotFound) as e:
+            log.log_error(self._credentials_error_message(e))
+            return False
         except BotoCoreError as e:
             log.log_error(f"AWS SDK connection failed: {e}")
             return False
         except Exception as e:
             log.log_error(f"Bedrock connection test failed: {e}")
             return False
+
+    async def discover_available_models(self) -> ProviderModelDiscoveryResult:
+        """Discover available Bedrock text/chat models for this region."""
+        try:
+            client = self._create_client('bedrock')
+            response = client.list_foundation_models(byInferenceType='ON_DEMAND')
+            models = []
+            for summary in response.get('modelSummaries', []):
+                model_id = summary.get('modelId')
+                if not model_id:
+                    continue
+                output_modalities = summary.get('outputModalities') or []
+                if output_modalities and 'TEXT' not in output_modalities:
+                    continue
+                models.append(model_id)
+
+            models = sorted(dict.fromkeys(models))
+            if not models:
+                return ProviderModelDiscoveryResult.failure_result(
+                    "No available Bedrock text models were found."
+                )
+            return ProviderModelDiscoveryResult.success_result(
+                models,
+                source_label=f"AWS Bedrock {self.aws_region}"
+            )
+
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            error_message = e.response['Error']['Message']
+            if error_code in ('AccessDeniedException', 'UnrecognizedClientException'):
+                return ProviderModelDiscoveryResult.failure_result(
+                    f"AWS authentication failed: {error_message}"
+                )
+            return ProviderModelDiscoveryResult.failure_result(
+                f"AWS Bedrock model discovery failed ({error_code}): {error_message}"
+            )
+        except (NoCredentialsError, PartialCredentialsError, ProfileNotFound) as e:
+            return ProviderModelDiscoveryResult.failure_result(
+                self._credentials_error_message(e)
+            )
+        except BotoCoreError as e:
+            return ProviderModelDiscoveryResult.failure_result(f"AWS SDK error: {e}")
+        except Exception as e:
+            log.log_error(f"Bedrock model discovery failed: {e}")
+            return ProviderModelDiscoveryResult.failure_result(
+                f"Bedrock model discovery failed: {e}"
+            )
 
     def get_capabilities(self) -> ProviderCapabilities:
         """Get provider capabilities for Bedrock Converse API."""
