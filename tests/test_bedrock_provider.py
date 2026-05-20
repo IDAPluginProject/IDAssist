@@ -255,6 +255,55 @@ class TestBedrockProviderChat(unittest.TestCase):
         self.assertEqual(final.tool_calls[0].arguments, {'symbol': 'main'})
 
     @patch(BEDROCK_MODULE + '.boto3')
+    def test_chat_completion_stream_native_callback_saves_openai_tool_shape(self, mock_boto3):
+        """Streaming native callback emits Query-compatible tool call records."""
+        import asyncio
+
+        mock_client = MagicMock()
+        mock_client.converse_stream.return_value = {
+            'stream': [
+                {'messageStart': {'role': 'assistant', 'messageId': 'msg-1'}},
+                {'contentBlockStart': {
+                    'contentBlockIndex': 0,
+                    'start': {'toolUse': {'toolUseId': 'tool-1', 'name': 'lookup'}}
+                }},
+                {'contentBlockDelta': {
+                    'contentBlockIndex': 0,
+                    'delta': {'toolUse': {'input': '{"symbol":"main"}'}}
+                }},
+                {'contentBlockStop': {'contentBlockIndex': 0}},
+                {'messageStop': {'stopReason': 'tool_use'}},
+                {'metadata': {'usage': {'inputTokens': 10, 'outputTokens': 5}}},
+            ]
+        }
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_client
+        mock_boto3.Session.return_value = mock_session
+
+        provider = self._create_provider()
+        request = self._make_request()
+        captured = []
+
+        async def consume():
+            async for _chunk in provider.chat_completion_stream(
+                request,
+                lambda msg, provider_type: captured.append((msg, provider_type)),
+            ):
+                pass
+
+        asyncio.run(consume())
+
+        self.assertEqual(len(captured), 1)
+        native_message, provider_type = captured[0]
+        self.assertEqual(provider_type, ProviderType.BEDROCK)
+        self.assertEqual(native_message['tool_calls'][0]['type'], 'function')
+        self.assertEqual(native_message['tool_calls'][0]['function']['name'], 'lookup')
+        self.assertEqual(
+            native_message['tool_calls'][0]['function']['arguments'],
+            '{"symbol": "main"}',
+        )
+
+    @patch(BEDROCK_MODULE + '.boto3')
     def test_test_connection_success(self, mock_boto3):
         """test_connection returns True when Bedrock API responds."""
         import asyncio

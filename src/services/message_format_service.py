@@ -272,6 +272,18 @@ class LiteLLMMessageAdapter(OpenAIMessageAdapter):
         return ProviderType.LITELLM
 
 
+class BedrockMessageAdapter(OpenAIMessageAdapter):
+    """Message format adapter for AWS Bedrock storage.
+
+    The Bedrock provider converts normalized ChatMessage objects to Converse
+    API payloads at request time, so persisted Query history can use the same
+    OpenAI-compatible tool-call shape as most other providers.
+    """
+
+    def get_provider_type(self) -> ProviderType:
+        return ProviderType.BEDROCK
+
+
 class AnthropicCLIMessageAdapter(OpenAIMessageAdapter):
     """Message format adapter for Anthropic CLI (Claude Code) - uses OpenAI-like format"""
 
@@ -373,6 +385,8 @@ class MessageFormatService:
             # Anthropic providers (alphabetically)
             ProviderType.ANTHROPIC_CLI: AnthropicCLIMessageAdapter(),
             ProviderType.ANTHROPIC_PLATFORM: anthropic_adapter,
+            # AWS Bedrock
+            ProviderType.BEDROCK: BedrockMessageAdapter(),
             # Gemini providers (alphabetically)
             ProviderType.GEMINI_OAUTH: openai_adapter,  # Storage uses OpenAI format; provider handles Gemini-native conversion
             ProviderType.GEMINI_PLATFORM: openai_adapter,  # OpenAI-compatible API

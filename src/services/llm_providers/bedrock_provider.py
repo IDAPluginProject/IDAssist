@@ -279,7 +279,14 @@ class BedrockProvider(BaseLLMProvider):
                     "role": "assistant",
                     "content": content,
                     "tool_calls": [
-                        {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": json.dumps(tc.arguments)
+                            }
+                        }
                         for tc in tool_calls
                     ] if tool_calls else [],
                     "model": self.model,
@@ -458,6 +465,26 @@ class BedrockProvider(BaseLLMProvider):
                 completion_tokens=output_token_count,
                 total_tokens=input_token_count + output_token_count,
             )
+
+            if native_message_callback:
+                native_message = {
+                    "role": "assistant",
+                    "content": accumulated_content,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": json.dumps(tc.arguments)
+                            }
+                        }
+                        for tc in accumulated_tool_calls
+                    ] if accumulated_tool_calls else [],
+                    "model": response_model,
+                    "stopReason": stop_reason,
+                }
+                native_message_callback(native_message, self.get_provider_type())
 
             yield ChatResponse(
                 content="",
