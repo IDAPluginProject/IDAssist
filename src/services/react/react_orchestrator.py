@@ -116,7 +116,8 @@ class ReActOrchestrator:
 
         self.conversation_history = cleaned_history
 
-    async def analyze(self, objective: str, initial_context: str = "") -> ReActResult:
+    async def analyze(self, objective: str, initial_context: str = "",
+                      approved_plan: Optional[str] = None) -> ReActResult:
         """
         Run ReAct analysis for the given objective.
 
@@ -144,11 +145,16 @@ class ReActOrchestrator:
         log.log_info(f"ReActOrchestrator: Starting analysis for: {objective[:50]}...")
 
         try:
-            # Phase 1: Planning
-            if self.on_progress:
-                self.on_progress("Planning investigation...", 0)
-
-            await self._run_planning(objective, initial_context)
+            # Phase 1: Planning. If the controller already got explicit user approval,
+            # seed the todo manager from that plan and skip a second planning call.
+            if approved_plan:
+                self.todo_manager.initialize_from_llm_response(approved_plan)
+                if self.on_todos_updated:
+                    self.on_todos_updated(self.todo_manager.to_transcript_snapshot())
+            else:
+                if self.on_progress:
+                    self.on_progress("Planning investigation...", 0)
+                await self._run_planning(objective, initial_context)
 
             if self.cancelled:
                 return ReActResult.cancelled()

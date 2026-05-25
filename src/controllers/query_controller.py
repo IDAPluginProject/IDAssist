@@ -31,6 +31,7 @@ from src.services.transcript_renderer import TranscriptRenderer
 from src.services.tool_approval_service import ToolApprovalService
 from src.controllers.react_thread import ReActOrchestratorThread
 from src.services.models.react_models import ReActConfig, ReActResult, ReActStatus
+from src.services.react.react_prompts import ReActPrompts
 
 
 class LLMQueryThread(QThread):
@@ -488,6 +489,45 @@ class ToolExecutorThread(QThread):
 _STREAM_ARG_UNSET = object()
 
 
+class ReActPlanningThread(QThread):
+    plan_complete = Signal(str)
+    plan_error = Signal(str)
+
+    def __init__(self, prompt: str, provider_config: dict, llm_factory, parent=None):
+        super().__init__(parent)
+        self.prompt = prompt
+        self.provider_config = provider_config
+        self.llm_factory = llm_factory
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+    def run(self):
+        try:
+            asyncio.run(self._run_plan())
+        except Exception as e:
+            if not self.cancelled:
+                self.plan_error.emit(str(e))
+
+    async def _run_plan(self):
+        if self.cancelled:
+            return
+        from src.services.models.llm_models import ChatMessage, ChatRequest, MessageRole
+
+        provider = self.llm_factory.create_provider(self.provider_config)
+        request = ChatRequest(
+            messages=[ChatMessage(role=MessageRole.USER, content=self.prompt)],
+            model=getattr(provider, "model", ""),
+            max_tokens=getattr(provider, "max_tokens", 4096),
+            temperature=0.3,
+            stream=False,
+        )
+        response = await provider.chat_completion(request)
+        if not self.cancelled:
+            self.plan_complete.emit(response.content or "")
+
+
 class QueryController:
     CHAT_TYPE_METADATA_KEY = "chat_type"
     DOCUMENT_CHAT_METADATA_KEY = "is_document_chat"
@@ -563,13 +603,22 @@ class QueryController:
 
         # ReAct (agentic mode) state
         self._react_thread: Optional[ReActOrchestratorThread] = None
+        self._react_planning_thread: Optional[ReActPlanningThread] = None
         self._react_active = False
+        self._react_plan_pending = False
         self._react_streaming_final_answer = False
         self._last_todo_snapshot = ""
         self._last_react_tasks: List[Dict[str, str]] = []
         self._current_react_run_id: Optional[str] = None
         self._current_react_objective: Optional[str] = None
         self._current_react_final_status: Optional[str] = None
+        self._pending_react_plan: Optional[str] = None
+        self._pending_react_initial_context: str = ""
+        self._pending_react_provider_config: Optional[Dict[str, Any]] = None
+        self._pending_react_provider_type: str = "anthropic_platform"
+        self._pending_react_mcp_tools: List[Dict[str, Any]] = []
+        self._pending_react_config: Optional[ReActConfig] = None
+        self._pending_react_refinements: List[str] = []
 
         # Connect view signals
         self._connect_signals()
@@ -606,6 +655,8 @@ class QueryController:
         self.view.agentic_enabled_changed.connect(self.on_agentic_enabled_changed)
         self.view.accept_all_tools_changed.connect(self.on_accept_all_tools_changed)
         self.view.approval_decision_requested.connect(self.on_approval_decision_requested)
+        self.view.plan_approved_requested.connect(self.on_react_plan_approved)
+        self.view.plan_cancel_requested.connect(self.on_react_plan_cancelled)
         self.view.transcript_link_clicked.connect(self.on_transcript_link_clicked)
         self.view.rlhf_feedback_requested.connect(self.handle_rlhf_feedback)
 
@@ -1249,6 +1300,9 @@ class QueryController:
 
         # Route to agentic mode if enabled
         if self.view.is_agentic_enabled():
+            if self._react_plan_pending:
+                self._refine_react_plan(query_text)
+                return
             self._submit_agentic_query(query_text)
             return
 
@@ -1349,6 +1403,12 @@ class QueryController:
         # Reset streaming state
         self._reasoning_filter.reset()
         self._streaming_renderer.reset()
+
+        if self._react_planning_thread and self._react_planning_thread.isRunning():
+            self._react_planning_thread.cancel()
+            self._react_planning_thread.wait(1000)
+            self.view.set_query_running(False)
+            return
 
         # Cancel ReAct if active
         if self._react_active and self._react_thread:
@@ -3604,6 +3664,123 @@ Tool Usage Guidelines:
     # ReAct (Agentic Mode) Methods
     # =========================================================================
 
+    def _build_react_planning_prompt(self, objective: str, initial_context: str,
+                                     previous_plan: Optional[str] = None,
+                                     refinement: Optional[str] = None) -> str:
+        base = ReActPrompts.get_planning_prompt(objective, initial_context)
+        if previous_plan:
+            base += f"\n\n## Previous Proposed Plan\n{previous_plan}\n"
+        if refinement:
+            base += (
+                f"\n\n## User Refinement Request\n{refinement}\n\n"
+                "Revise the plan to incorporate this feedback. Return only the updated markdown checklist."
+            )
+        else:
+            base += "\n\nReturn only the proposed markdown checklist and any brief assumptions needed to execute it."
+        return base
+
+    def _start_react_planning(self, objective: str, initial_context: str,
+                              provider_config: Dict[str, Any],
+                              previous_plan: Optional[str] = None,
+                              refinement: Optional[str] = None):
+        if self._react_planning_thread and self._react_planning_thread.isRunning():
+            self._react_planning_thread.cancel()
+            self._react_planning_thread.wait(1000)
+
+        prompt = self._build_react_planning_prompt(objective, initial_context, previous_plan, refinement)
+        self._react_planning_thread = ReActPlanningThread(prompt, provider_config, self.llm_factory)
+        self._react_planning_thread.plan_complete.connect(self._on_react_plan_ready)
+        self._react_planning_thread.plan_error.connect(self._on_react_plan_error)
+        self.view.set_query_running(True)
+        self._react_planning_thread.start()
+
+    def _on_react_plan_ready(self, plan_text: str):
+        self._pending_react_plan = plan_text.strip()
+        self._react_plan_pending = True
+        self.view.set_query_running(False)
+        self.view.set_pending_plan(self._pending_react_plan)
+        if self.current_chat_id and self._current_query_binary_hash and self._pending_react_plan:
+            self.transcript_service.append_todo_snapshot(
+                self._current_query_binary_hash,
+                str(self.current_chat_id),
+                self._pending_react_plan,
+                [],
+                metadata_extra={
+                    "react_run_id": self._current_react_run_id,
+                    "react_objective": self._current_react_objective,
+                    "agent_phase": "plan_pending",
+                },
+            )
+        self._refresh_transcript_view("")
+
+    def _on_react_plan_error(self, error: str):
+        log.log_error(f"ReAct planning error: {error}")
+        self.view.set_query_running(False)
+        self._react_plan_pending = False
+        self.view.set_pending_plan(None)
+        self._add_message_to_chat(self.current_chat_id, "error", f"**Agentic Planning Error:** {error}")
+        self._current_query_binary_hash = None
+
+    def _refine_react_plan(self, refinement_text: str):
+        if not self._react_plan_pending or not self._pending_react_provider_config:
+            return
+        self._pending_react_refinements.append(refinement_text)
+        if self.current_chat_id and self._current_query_binary_hash:
+            self.transcript_service.append_event(
+                self._current_query_binary_hash,
+                str(self.current_chat_id),
+                TranscriptEventKind.USER_MESSAGE,
+                "user",
+                refinement_text,
+                metadata={"agent_phase": "plan_refinement", "react_run_id": self._current_react_run_id},
+            )
+        self._start_react_planning(
+            self._current_react_objective or refinement_text,
+            self._pending_react_initial_context,
+            self._pending_react_provider_config,
+            previous_plan=self._pending_react_plan,
+            refinement=refinement_text,
+        )
+
+    def on_react_plan_cancelled(self):
+        if self._react_planning_thread and self._react_planning_thread.isRunning():
+            self._react_planning_thread.cancel()
+        self._react_plan_pending = False
+        self._pending_react_plan = None
+        self.view.set_pending_plan(None)
+        self.view.set_query_running(False)
+        self._current_react_run_id = None
+        self._current_react_objective = None
+        self._current_query_binary_hash = None
+
+    def on_react_plan_approved(self):
+        if not self._react_plan_pending or not self._pending_react_plan:
+            return
+        self._react_plan_pending = False
+        self.view.set_pending_plan(None)
+        if self.current_chat_id and self._current_query_binary_hash:
+            self.transcript_service.append_iteration_notice(
+                self._current_query_binary_hash,
+                str(self.current_chat_id),
+                "Approved agentic investigation plan",
+                metadata={"category": "plan_approved"},
+                metadata_extra={
+                    "react_run_id": self._current_react_run_id,
+                    "react_objective": self._current_react_objective,
+                    "agent_phase": "plan_approved",
+                },
+            )
+
+        provider = self.llm_factory.create_provider(self._pending_react_provider_config)
+        self._start_react_analysis(
+            self._current_react_objective or "",
+            self._pending_react_initial_context,
+            provider,
+            self._pending_react_mcp_tools,
+            self._pending_react_config or ReActConfig(max_iterations=15, reflection_enabled=True),
+            approved_plan=self._pending_react_plan,
+        )
+
     def _submit_agentic_query(self, query_text: str):
         """Handle agentic (ReAct) query submission"""
         log.log_info(f"Agentic query submitted: {query_text[:50]}...")
@@ -3625,12 +3802,11 @@ Tool Usage Guidelines:
             if self.current_chat_id is None:
                 self.new_chat()
 
-            # Set active state
-            self._react_active = True
+            # Set planning state. Tools are not initialized/executed until plan approval.
+            self._react_plan_pending = False
             self._current_react_run_id = react_run_id
             self._current_react_objective = query_text
             self._current_query_binary_hash = self._get_current_binary_hash()
-            self.view.set_query_running(True)
             self._active_stream_markdown = ""
             self._stream_base_html = ""
             self._context_snapshot = self._build_context_snapshot()
@@ -3678,22 +3854,21 @@ Tool Usage Guidelines:
                     + initial_context
                 )
 
-            # MCP tools are required for agentic mode
-            self.mcp_connection_manager.ensure_connections()
-            mcp_tools = self.mcp_connection_manager.get_available_tools_for_llm()
-            log.log_info(f"Agentic mode with {len(mcp_tools)} tools available")
-
-            # Create provider instance
-            provider = self.llm_factory.create_provider(active_provider)
-
             # Create ReAct config
             config = ReActConfig(
                 max_iterations=15,
                 reflection_enabled=True
             )
 
-            # Start ReAct thread
-            self._start_react_analysis(query_text, initial_context, provider, mcp_tools, config)
+            self._pending_react_initial_context = initial_context
+            self._pending_react_provider_config = active_provider
+            self._pending_react_provider_type = provider_type
+            self._pending_react_mcp_tools = []
+            self._pending_react_config = config
+            self._pending_react_refinements = []
+            self._pending_react_plan = None
+
+            self._start_react_planning(query_text, initial_context, active_provider)
 
         except Exception as e:
             error_msg = f"Exception in submit_agentic_query: {str(e)}"
@@ -3716,9 +3891,17 @@ Current Offset: {context.get('offset_hex', 'N/A')}"""
 
     def _start_react_analysis(self, objective: str, initial_context: str,
                               provider, mcp_tools: List[Dict[str, Any]],
-                              config: ReActConfig):
+                              config: ReActConfig,
+                              approved_plan: Optional[str] = None):
         """Start the ReAct analysis thread"""
         log.log_info("Starting ReAct analysis thread")
+        self._react_active = True
+        self.view.set_query_running(True)
+
+        if not mcp_tools:
+            self.mcp_connection_manager.ensure_connections()
+            mcp_tools = self.mcp_connection_manager.get_available_tools_for_llm()
+            log.log_info(f"Agentic mode with {len(mcp_tools)} tools available")
 
         # Reset streaming state for ReAct analysis
         self._reasoning_filter.reset()
@@ -3738,7 +3921,8 @@ Current Offset: {context.get('offset_hex', 'N/A')}"""
             llm_provider=provider,
             mcp_orchestrator=self.mcp_orchestrator,
             mcp_tools=mcp_tools,
-            config=config
+            config=config,
+            approved_plan=approved_plan
         )
 
         # Connect signals
@@ -3941,6 +4125,8 @@ Current Offset: {context.get('offset_hex', 'N/A')}"""
         self._current_react_run_id = None
         self._current_react_objective = None
         self._current_react_final_status = None
+        self._pending_react_plan = None
+        self._pending_react_provider_config = None
         self._current_query_binary_hash = None
         self.view.set_query_running(False)
 
@@ -3970,6 +4156,8 @@ Current Offset: {context.get('offset_hex', 'N/A')}"""
         self._current_react_run_id = None
         self._current_react_objective = None
         self._current_react_final_status = None
+        self._pending_react_plan = None
+        self._pending_react_provider_config = None
         self._current_query_binary_hash = None
         self.view.set_query_running(False)
 

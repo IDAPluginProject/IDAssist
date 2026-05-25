@@ -81,6 +81,8 @@ class QueryTabView(QWidget):
     agentic_enabled_changed = Signal(bool)
     accept_all_tools_changed = Signal(bool)
     approval_decision_requested = Signal(str)
+    plan_approved_requested = Signal()
+    plan_cancel_requested = Signal()
     transcript_link_clicked = Signal(str)
     history_entry_upsert_requested = Signal(int, str, str, str)
     # RLHF feedback signals
@@ -111,6 +113,7 @@ class QueryTabView(QWidget):
         # Main text widget - HTML browser/Markdown editor
         self.create_main_text_widget()
 
+        self.create_plan_panel()
         self.create_approval_panel()
 
         # History table
@@ -122,12 +125,13 @@ class QueryTabView(QWidget):
         # Add widgets to splitter
         self.splitter.addWidget(self.query_browser)
         self.splitter.addWidget(self.query_editor)
+        self.splitter.addWidget(self.plan_panel)
         self.splitter.addWidget(self.approval_panel)
         self.splitter.addWidget(self.history_table)
         self.splitter.addWidget(self.input_widget)
 
         # Set initial splitter sizes (give more space to main text and input)
-        self.splitter.setSizes([400, 400, 0, 80, 100])
+        self.splitter.setSizes([400, 400, 0, 0, 80, 100])
 
         layout.addWidget(self.splitter)
 
@@ -343,9 +347,10 @@ class QueryTabView(QWidget):
 
         # Save history and input panel sizes before the swap
         old_sizes = self.splitter.sizes()
-        approval_size = old_sizes[2] if len(old_sizes) >= 3 else 0
-        history_size = old_sizes[3] if len(old_sizes) >= 4 else 80
-        input_size = old_sizes[4] if len(old_sizes) >= 5 else 100
+        plan_size = old_sizes[2] if len(old_sizes) >= 3 else 0
+        approval_size = old_sizes[3] if len(old_sizes) >= 4 else 0
+        history_size = old_sizes[4] if len(old_sizes) >= 5 else 80
+        input_size = old_sizes[5] if len(old_sizes) >= 6 else 100
 
         if self.is_edit_mode:
             self.query_browser.hide()
@@ -364,11 +369,11 @@ class QueryTabView(QWidget):
 
         # Restore: give all remaining space to the active text widget
         total = sum(self.splitter.sizes())
-        active_size = total - approval_size - history_size - input_size
+        active_size = total - plan_size - approval_size - history_size - input_size
         if self.is_edit_mode:
-            self.splitter.setSizes([0, active_size, approval_size, history_size, input_size])
+            self.splitter.setSizes([0, active_size, plan_size, approval_size, history_size, input_size])
         else:
-            self.splitter.setSizes([active_size, 0, approval_size, history_size, input_size])
+            self.splitter.setSizes([active_size, 0, plan_size, approval_size, history_size, input_size])
 
         self.edit_mode_changed.emit(self.is_edit_mode)
 
@@ -378,15 +383,16 @@ class QueryTabView(QWidget):
             return
         self.is_edit_mode = False
         old_sizes = self.splitter.sizes()
-        approval_size = old_sizes[2] if len(old_sizes) >= 3 else 0
-        history_size = old_sizes[3] if len(old_sizes) >= 4 else 80
-        input_size = old_sizes[4] if len(old_sizes) >= 5 else 100
+        plan_size = old_sizes[2] if len(old_sizes) >= 3 else 0
+        approval_size = old_sizes[3] if len(old_sizes) >= 4 else 0
+        history_size = old_sizes[4] if len(old_sizes) >= 5 else 80
+        input_size = old_sizes[5] if len(old_sizes) >= 6 else 100
         self.query_editor.hide()
         self.query_browser.show()
         self.edit_save_button.setText("Edit")
         total = sum(self.splitter.sizes())
-        active_size = total - approval_size - history_size - input_size
-        self.splitter.setSizes([active_size, 0, approval_size, history_size, input_size])
+        active_size = total - plan_size - approval_size - history_size - input_size
+        self.splitter.setSizes([active_size, 0, plan_size, approval_size, history_size, input_size])
 
     def on_submit_clicked(self):
         """Handle submit button click - toggles between submit and stop"""
@@ -696,17 +702,28 @@ class QueryTabView(QWidget):
         self.approval_panel.show()
         self._restore_splitter_after_approval_change(approval_visible=True)
 
+    def set_pending_plan(self, plan_text: str = None):
+        if not plan_text:
+            self.plan_panel.hide()
+            self.plan_preview.setPlainText("")
+            self._restore_splitter_after_approval_change()
+            return
+        self.plan_preview.setPlainText(plan_text)
+        self.plan_panel.show()
+        self._restore_splitter_after_approval_change()
+
     def _restore_splitter_after_approval_change(self, approval_visible: bool = False):
         sizes = self.splitter.sizes()
-        if len(sizes) < 5:
+        if len(sizes) < 6:
             return
+        plan_size = 170 if self.plan_panel.isVisible() else 0
         approval_size = 96 if approval_visible else 0
-        remaining = sum(sizes) - approval_size
+        remaining = sum(sizes) - plan_size - approval_size
         active_index = 1 if self.is_edit_mode else 0
-        history_size = sizes[3]
-        input_size = sizes[4]
+        history_size = sizes[4]
+        input_size = sizes[5]
         active_size = max(0, remaining - history_size - input_size)
-        updated = [0, 0, approval_size, history_size, input_size]
+        updated = [0, 0, plan_size, approval_size, history_size, input_size]
         updated[active_index] = active_size
         self.splitter.setSizes(updated)
 
@@ -843,3 +860,42 @@ class QueryTabView(QWidget):
             self.rlhf_feedback_requested.emit(False)
         elif ":" in url_str:
             self.transcript_link_clicked.emit(url_str)
+    def create_plan_panel(self):
+        self.plan_panel = QWidget()
+        self.plan_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.plan_panel.setStyleSheet(
+            "QWidget { border: 1px solid #4f8cc9; background: #303842; }"
+            "QLabel { border: none; color: #d8dee9; }"
+            "QPlainTextEdit { border: none; background: #2f3439; color: #d8dee9; padding: 4px; }"
+            "QPushButton { margin: 3px; padding: 3px 8px; }"
+        )
+        panel_layout = QVBoxLayout()
+        panel_layout.setContentsMargins(6, 5, 6, 5)
+        panel_layout.setSpacing(4)
+
+        self.plan_summary_label = QLabel("Review the proposed investigation plan. Submit refinement details below, or approve to run.")
+        self.plan_summary_label.setWordWrap(True)
+        self.plan_summary_label.setStyleSheet("font-size: 11px;")
+        panel_layout.addWidget(self.plan_summary_label)
+
+        self.plan_preview = QPlainTextEdit()
+        self.plan_preview.setReadOnly(True)
+        self.plan_preview.setMaximumBlockCount(300)
+        self.plan_preview.setMaximumHeight(130)
+        self.plan_preview.setStyleSheet("font-family: monospace; font-size: 11px;")
+        panel_layout.addWidget(self.plan_preview)
+
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.setSpacing(4)
+        self.approve_plan_button = QPushButton("Approve Plan")
+        self.cancel_plan_button = QPushButton("Cancel")
+        self.approve_plan_button.clicked.connect(self.plan_approved_requested.emit)
+        self.cancel_plan_button.clicked.connect(self.plan_cancel_requested.emit)
+        button_row.addWidget(self.approve_plan_button)
+        button_row.addWidget(self.cancel_plan_button)
+        button_row.addStretch()
+        panel_layout.addLayout(button_row)
+
+        self.plan_panel.setLayout(panel_layout)
+        self.plan_panel.hide()

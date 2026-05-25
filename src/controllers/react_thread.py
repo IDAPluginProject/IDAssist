@@ -44,6 +44,7 @@ class ReActOrchestratorThread(QThread):
                  mcp_orchestrator,
                  mcp_tools: List[Dict[str, Any]],
                  config: ReActConfig = None,
+                 approved_plan: Optional[str] = None,
                  parent=None):
         """
         Initialize the ReAct orchestrator thread.
@@ -64,6 +65,7 @@ class ReActOrchestratorThread(QThread):
         self.mcp_orchestrator = mcp_orchestrator
         self.mcp_tools = mcp_tools
         self.config = config or ReActConfig()
+        self.approved_plan = approved_plan
         self.cancelled = False
         self._orchestrator: Optional[ReActOrchestrator] = None
 
@@ -123,7 +125,8 @@ class ReActOrchestratorThread(QThread):
         # Run analysis
         result = await self._orchestrator.analyze(
             self.objective,
-            self.initial_context
+            self.initial_context,
+            approved_plan=self.approved_plan,
         )
 
         return result
