@@ -10,10 +10,11 @@ import json
 from typing import List, Dict, Any, AsyncGenerator, Optional, Callable
 
 try:
+    import httpx
     import openai
     from openai import OpenAI
 except ImportError:
-    raise ImportError("openai package not available. Install with: pip install openai")
+    raise ImportError("openai/httpx packages not available. Install with: pip install openai httpx")
 
 from .base_provider import (
     BaseLLMProvider, APIProviderError, AuthenticationError,
@@ -53,53 +54,42 @@ class OpenAIPlatformApiProvider(BaseLLMProvider):
         # Initialize OpenAI client
         try:
             timeout = self.timeout
-
-            # Handle base_url - use default if not specified or standard OpenAI URL
-            base_url = None
-            if self.url and self.url != 'https://api.openai.com/v1':
-                base_url = self.url
+            base_url = self._get_client_base_url()
 
             # For local providers that don't need API keys, use a placeholder
             api_key = self.api_key or "not-needed"
 
-            # Handle TLS verification settings and create client
-            if self.disable_tls:
-                import httpx
-                import ssl
-                log.log_warn(f"TLS verification disabled for OpenAI provider '{self.name}'")
-
-                # Create SSL context that doesn't verify certificates
-                ssl_context = ssl.create_default_context()
-                ssl_context.check_hostname = False
-                ssl_context.verify_mode = ssl.CERT_NONE
-
-                # Create httpx client with disabled verification
-                http_client = httpx.Client(verify=False, timeout=timeout)
-
-                self._client = OpenAI(
-                    api_key=api_key,
-                    base_url=base_url,
-                    timeout=timeout,
-                    max_retries=0,  # We handle retries ourselves
-                    http_client=http_client
-                )
-            else:
-                import httpx
-                # Respect bypass_proxy setting (default False: use system proxy)
-                _bypass_proxy = self.config.get('bypass_proxy', False)
-                _http_client = httpx.Client(trust_env=not _bypass_proxy, timeout=timeout)
-                if _bypass_proxy:
-                    log.log_debug("OpenAI: Bypassing system proxy (trust_env=False)")
-                self._client = OpenAI(
-                    api_key=api_key,
-                    base_url=base_url,
-                    timeout=timeout,
-                    max_retries=0,  # We handle retries ourselves
-                    http_client=_http_client
-                )
+            self._client = OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                timeout=timeout,
+                max_retries=0,  # We handle retries ourselves
+                http_client=self._create_http_client(timeout)
+            )
 
         except Exception as e:
             raise APIProviderError(f"Failed to initialize OpenAI client: {e}")
+
+    def _get_client_base_url(self) -> Optional[str]:
+        """Return the base URL passed to the OpenAI SDK client."""
+        if self.url and self.url != 'https://api.openai.com/v1':
+            return self.url
+        return None
+
+    def _create_http_client(self, timeout: int) -> httpx.Client:
+        """Create the HTTP client while keeping TLS and proxy controls independent."""
+        bypass_proxy = self.config.get('bypass_proxy', False)
+
+        if self.disable_tls:
+            log.log_warn(f"TLS verification disabled for OpenAI provider '{self.name}'")
+        if bypass_proxy:
+            log.log_debug("OpenAI: Bypassing system proxy (trust_env=False)")
+
+        return httpx.Client(
+            verify=not self.disable_tls,
+            trust_env=not bypass_proxy,
+            timeout=timeout
+        )
 
     def _is_reasoning_model(self) -> bool:
         """Check if the current model is an o* reasoning model."""
@@ -756,11 +746,10 @@ class OpenAIPlatformApiProviderFactory(ProviderFactory):
 
     def supports_provider_type(self, provider_type: ProviderType) -> bool:
         """Check if this factory supports the provider type"""
-        # OpenAI provider handles OpenAI-compatible APIs
+        # OpenAI provider handles OpenAI-compatible APIs with /v1 bases.
         return provider_type in {
             ProviderType.OPENAI_PLATFORM,
             ProviderType.LMSTUDIO,
-            ProviderType.OPENWEBUI,
             ProviderType.XAI_PLATFORM,
             ProviderType.GEMINI_PLATFORM,
         }
