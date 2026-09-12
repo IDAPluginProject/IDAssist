@@ -107,6 +107,7 @@ class LiteLLMProvider(OpenAIPlatformApiProvider):
         - bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0 -> anthropic
         - bedrock-anthropic.claude-3-5-sonnet-20241022-v2:0 -> anthropic
         - bedrock-claude-sonnet-4-5 -> anthropic
+        - bedrock.openai.gpt-5 -> openai
         - bedrock/amazon.nova-pro-v1:0 -> amazon
         - bedrock/meta.llama3-70b-instruct-v1:0 -> meta
         - bedrock/gpt-oss-120b -> openai
@@ -148,10 +149,10 @@ class LiteLLMProvider(OpenAIPlatformApiProvider):
         """
         Check if this is a Bedrock model.
 
-        Supports both 'bedrock/' and 'bedrock-' prefixes for LiteLLM compatibility.
+        Supports slash, dash, and dotted LiteLLM model-group prefixes.
         """
         model_lower = self.model.lower()
-        return model_lower.startswith('bedrock/') or model_lower.startswith('bedrock-')
+        return model_lower.startswith(('bedrock/', 'bedrock-', 'bedrock.'))
 
     @staticmethod
     def _field(obj: Any, name: str, default=None):
@@ -298,6 +299,187 @@ class LiteLLMProvider(OpenAIPlatformApiProvider):
 
         return completion_kwargs
 
+    @staticmethod
+    def _tool_call_id(tool_call: Dict[str, Any]) -> Optional[str]:
+        """Return an OpenAI-format tool call identifier."""
+        tool_call_id = tool_call.get("id")
+        return str(tool_call_id) if tool_call_id else None
+
+    @classmethod
+    def _sanitize_tool_history(cls, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Keep only adjacent, one-to-one tool call/result pairs.
+
+        Bedrock rejects orphaned and duplicate tool results. Persisted chat
+        history can contain either after an interrupted continuation or an
+        older IDAssist version, so normalize it at the provider boundary.
+        """
+        sanitized: List[Dict[str, Any]] = []
+        dropped_results = 0
+        dropped_calls = 0
+        repaired_pairs = 0
+        seen_result_ids = set()
+        index = 0
+
+        while index < len(messages):
+            message = dict(messages[index])
+            tool_calls = message.get("tool_calls") or []
+            if message.get("role") == "assistant" and tool_calls:
+                result_by_id: Dict[str, Dict[str, Any]] = {}
+                next_index = index + 1
+                while next_index < len(messages) and messages[next_index].get("role") == "tool":
+                    result = dict(messages[next_index])
+                    result_id = result.get("tool_call_id")
+                    normalized_result_id = str(result_id) if result_id else None
+                    if (normalized_result_id and
+                            normalized_result_id not in seen_result_ids and
+                            normalized_result_id not in result_by_id):
+                        result_by_id[normalized_result_id] = result
+                    else:
+                        dropped_results += 1
+                    next_index += 1
+
+                valid_calls = []
+                valid_results = []
+                for tool_call in tool_calls:
+                    tool_call_id = cls._tool_call_id(tool_call)
+                    if tool_call_id and tool_call_id in result_by_id:
+                        valid_calls.append(tool_call)
+                        valid_results.append(result_by_id.pop(tool_call_id))
+                        seen_result_ids.add(tool_call_id)
+                    else:
+                        dropped_calls += 1
+
+                dropped_results += len(result_by_id)
+                if valid_calls:
+                    message["tool_calls"] = valid_calls
+                    sanitized.append(message)
+                    sanitized.extend(valid_results)
+                else:
+                    message.pop("tool_calls", None)
+                    content = message.get("content")
+                    if isinstance(content, str) and content.strip():
+                        sanitized.append(message)
+
+                index = next_index
+                continue
+
+            if message.get("role") == "tool":
+                orphan_results = []
+                synthetic_calls = []
+                while index < len(messages) and messages[index].get("role") == "tool":
+                    result = dict(messages[index])
+                    result_id = result.get("tool_call_id")
+                    tool_name = result.get("name")
+                    if (result_id and tool_name and
+                            str(result_id) not in seen_result_ids):
+                        result_id = str(result_id)
+                        synthetic_calls.append({
+                            "id": result_id,
+                            "type": "function",
+                            "function": {
+                                "name": str(tool_name),
+                                "arguments": "{}",
+                            },
+                        })
+                        orphan_results.append(result)
+                        seen_result_ids.add(result_id)
+                    else:
+                        dropped_results += 1
+                    index += 1
+
+                if synthetic_calls:
+                    sanitized.append({
+                        "role": "assistant",
+                        "content": " ",
+                        "tool_calls": synthetic_calls,
+                    })
+                    sanitized.extend(orphan_results)
+                    repaired_pairs += len(synthetic_calls)
+                continue
+
+            sanitized.append(message)
+            index += 1
+
+        if dropped_calls or dropped_results or repaired_pairs:
+            log.log_warn(
+                "LiteLLM: Repaired invalid tool history "
+                f"(removed {dropped_calls} unmatched call(s), "
+                f"{dropped_results} unusable/duplicate result(s), "
+                f"reconstructed {repaired_pairs} missing call(s))"
+            )
+
+        return sanitized
+
+    @staticmethod
+    def _compatibility_retry_kwargs(
+        completion_kwargs: Dict[str, Any], error_message: str
+    ) -> tuple[Dict[str, Any], List[str]]:
+        """Remove only optional fields explicitly rejected by a backend."""
+        retry_kwargs = dict(completion_kwargs)
+        removed: List[str] = []
+        error_lower = error_message.lower()
+        unsupported_markers = (
+            "doesn't support",
+            "does not support",
+            "unsupported",
+            "unknown parameter",
+            "unknown_parameter",
+        )
+        is_unsupported = any(marker in error_lower for marker in unsupported_markers)
+
+        if is_unsupported and "temperature" in error_lower and "temperature" in retry_kwargs:
+            retry_kwargs.pop("temperature", None)
+            removed.append("temperature")
+
+        thinking_rejected = is_unsupported and "thinking" in error_lower
+        reasoning_rejected = is_unsupported and "reasoning_effort" in error_lower
+        if thinking_rejected or reasoning_rejected:
+            if "thinking" in retry_kwargs:
+                retry_kwargs.pop("thinking", None)
+                removed.append("thinking")
+            if "reasoning_effort" in retry_kwargs:
+                retry_kwargs.pop("reasoning_effort", None)
+                removed.append("reasoning_effort")
+
+            extra_body = dict(retry_kwargs.get("extra_body") or {})
+            if "thinking" in extra_body:
+                extra_body.pop("thinking", None)
+                removed.append("extra_body.thinking")
+            if extra_body:
+                retry_kwargs["extra_body"] = extra_body
+            else:
+                retry_kwargs.pop("extra_body", None)
+
+            # Thinking blocks are only valid when thinking is enabled. Remove
+            # stored metadata when retrying without that optional capability.
+            cleaned_messages = []
+            for original_message in retry_kwargs.get("messages", []):
+                message = dict(original_message)
+                message.pop("thinking_blocks", None)
+                message.pop("reasoning_content", None)
+                cleaned_messages.append(message)
+            retry_kwargs["messages"] = cleaned_messages
+
+        return retry_kwargs, removed
+
+    def _create_completion_with_compatibility(self, completion_kwargs: Dict[str, Any]):
+        """Retry unsupported optional parameters without masking other 400s."""
+        current_kwargs = completion_kwargs
+        for retry_count in range(3):
+            try:
+                return self._client.chat.completions.create(**current_kwargs)
+            except openai.BadRequestError as exc:
+                retry_kwargs, removed = self._compatibility_retry_kwargs(
+                    current_kwargs, str(exc)
+                )
+                if not removed or retry_count == 2:
+                    raise
+                log.log_warn(
+                    "LiteLLM backend rejected optional parameter(s) "
+                    f"{', '.join(removed)}; retrying without them"
+                )
+                current_kwargs = retry_kwargs
+
     def _prepare_messages(self, messages: List[ChatMessage]) -> List[Dict[str, Any]]:
         """
         Convert BinAssist ChatMessage objects to LiteLLM format.
@@ -330,13 +512,15 @@ class LiteLLMProvider(OpenAIPlatformApiProvider):
                     thinking_blocks = native.get('thinking_blocks')
                     reasoning_content = native.get('reasoning_content')
 
-                    if thinking_blocks:
+                    if thinking_enabled and thinking_blocks:
                         result[i]['thinking_blocks'] = thinking_blocks
                         log.log_debug(f"LiteLLM: Added {len(thinking_blocks)} thinking_blocks to message {i}")
 
-                    if reasoning_content:
+                    if thinking_enabled and reasoning_content:
                         result[i]['reasoning_content'] = reasoning_content
                         log.log_debug(f"LiteLLM: Added reasoning_content ({len(reasoning_content)} chars) to message {i}")
+
+        result = self._sanitize_tool_history(result)
 
         # Debug: Log the messages being sent to LiteLLM
         log.log_info(f"LITELLM _prepare_messages DEBUG - {len(messages)} ChatMessages -> {len(result)} API messages:")
@@ -396,7 +580,7 @@ class LiteLLMProvider(OpenAIPlatformApiProvider):
             completion_kwargs["stream"] = False
 
             # Make API call
-            response = self._client.chat.completions.create(**completion_kwargs)
+            response = self._create_completion_with_compatibility(completion_kwargs)
             content, tool_calls, usage, finish_reason, native_content_for_response = (
                 self._normalize_nonstream_response(response)
             )
@@ -584,7 +768,7 @@ class LiteLLMProvider(OpenAIPlatformApiProvider):
             completion_kwargs["stream_options"] = {"include_usage": True}
 
             # Make streaming API call
-            stream = self._client.chat.completions.create(**completion_kwargs)
+            stream = self._create_completion_with_compatibility(completion_kwargs)
 
             accumulated_content = ""
             accumulated_reasoning = ""  # Track reasoning content for thinking-enabled models

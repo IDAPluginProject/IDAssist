@@ -331,7 +331,7 @@ class SettingsService:
         """Detect underlying model family from model name for LiteLLM."""
         model_lower = model.lower()
 
-        if model_lower.startswith('bedrock/'):
+        if model_lower.startswith(('bedrock/', 'bedrock-', 'bedrock.')):
             if 'anthropic' in model_lower or 'claude' in model_lower:
                 return 'anthropic'
             elif 'amazon' in model_lower or 'nova' in model_lower:
@@ -356,7 +356,7 @@ class SettingsService:
 
     def _is_bedrock_model(self, model: str) -> bool:
         """Check if this is a Bedrock model"""
-        return model.startswith('bedrock/')
+        return model.lower().startswith(('bedrock/', 'bedrock-', 'bedrock.'))
 
     def add_llm_provider(self, name: str, model: str, url: str, max_tokens: int = 4096,
                         api_key: str = '', disable_tls: bool = False, provider_type: str = 'openai_platform',
