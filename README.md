@@ -137,11 +137,11 @@ IDAssist supports the following provider types:
 
 ### Recommended Models
 
-| Provider | Model | Strengths |
-|----------|-------|-----------|
-| Anthropic | `claude-sonnet-4-6` | Strong code analysis, extended thinking |
-| OpenAI | `gpt-5.3-codex` | Fast, good general analysis |
-| Ollama | `qwen2.5-coder:32b` | Local, no API key needed |
+- **Open-weight models**: GLM, Qwen, DeepSeek, Nemotron, Gemma, and Muse are recommended families for local or self-hosted analysis. Choose an instruction-tuned, coding, or reasoning model supported by your runtime.
+- **Hosted frontier models**: Opus, Sonnet, and GPT are recommended for code analysis and complex investigations.
+- **Agentic mode and Actions**: Choose a model and serving backend with reliable native tool calling and multi-step reasoning. Extended thinking controls depend on the selected model and provider.
+
+These are family names, not literal API identifiers. In Settings, enter the exact model ID or installed tag provided by your endpoint. See the [model guidance](docs/index.md#recommended-models) for selection criteria and official model resources.
 
 ## Using the Semantic Graph
 

@@ -67,16 +67,18 @@ If the panel doesn't appear automatically, press **Ctrl+Shift+A** or go to **Edi
 
 Navigate to the **Settings** tab to configure your LLM provider. IDAssist needs at least one configured provider before it can analyze functions.
 
+Recommended open-weight families are **GLM, Qwen, DeepSeek, Nemotron, Gemma, and Muse**; hosted frontier options include **Opus, Sonnet, and GPT**. See the [model guidance](index.md#recommended-models) for selection criteria. Family names are recommendations: the **Model** field requires the exact ID or tag from your provider.
+
 ### Option 1: Ollama (Local, Free)
 
 Best for getting started quickly with no API keys.
 
 1. Install Ollama from [ollama.com](https://ollama.com)
-2. Pull a model: `ollama pull qwen2.5-coder:32b`
+2. Choose a supported model from the [Ollama library](https://ollama.com/library) that fits your machine's memory and context needs. Run `ollama pull MODEL_TAG`, replacing `MODEL_TAG` with its exact tag, then use `ollama list` to confirm the installed tag.
 3. In IDAssist Settings, click **Add** under LLM Providers:
    - **Name:** `Ollama`
    - **Type:** `ollama`
-   - **Model:** `qwen2.5-coder:32b`
+   - **Model:** The exact installed tag shown by `ollama list`
    - **URL:** `http://localhost:11434`
    - **API Key:** (leave blank)
 4. Click **Save**, then set as **Active Provider**
@@ -87,7 +89,7 @@ Best for getting started quickly with no API keys.
 2. In IDAssist Settings, click **Add**:
    - **Name:** `OpenAI`
    - **Type:** `openai_platform`
-   - **Model:** `gpt-4o`
+   - **Model:** The exact GPT model ID available from your provider's model catalog
    - **URL:** `https://api.openai.com/v1`
    - **API Key:** your key
 3. Click **Save**, then set as **Active Provider**
@@ -98,7 +100,7 @@ Best for getting started quickly with no API keys.
 2. In IDAssist Settings, click **Add**:
    - **Name:** `Claude`
    - **Type:** `anthropic_platform`
-   - **Model:** `claude-sonnet-4-6`
+   - **Model:** The exact Sonnet or Opus model ID available from your provider's model catalog
    - **URL:** `https://api.anthropic.com`
    - **API Key:** your key
 3. Click **Save**, then set as **Active Provider**
@@ -111,7 +113,7 @@ Use LiteLLM to route through multiple providers with a single endpoint.
 2. In IDAssist Settings, click **Add**:
    - **Name:** `LiteLLM`
    - **Type:** `litellm`
-   - **Model:** your model name
+   - **Model:** The model alias configured on your proxy for your chosen family
    - **URL:** your proxy URL
    - **API Key:** your proxy key (if required)
 3. Click **Save**, then set as **Active Provider**
@@ -124,7 +126,7 @@ Use AWS Bedrock Converse API directly via boto3. Requires an AWS account with Be
 2. In IDAssist Settings, click **Add**:
    - **Name:** `AWS Bedrock`
    - **Type:** `bedrock`
-   - **Model:** e.g., `anthropic.claude-sonnet-4-6`
+   - **Model:** The exact Bedrock model ID or inference profile ID available in your region for your chosen model (such as Sonnet or Opus)
    - **AWS Region:** e.g., `us-east-1`
    - **AWS Profile:** (optional) named profile from credentials file
    - **AWS Access Key / Secret Key:** (optional) overrides credential chain

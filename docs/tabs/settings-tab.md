@@ -9,14 +9,16 @@ The Settings tab manages LLM providers, MCP providers, SymGraph integration, the
 
 ## LLM Providers
 
+See the [recommended model families](../index.md#recommended-models) for open-weight and hosted options. Use the exact model ID from your provider's catalog or the installed tag from `ollama list`; family names such as Qwen, Sonnet, and GPT are not necessarily valid API identifiers.
+
 ### Provider Table
 
 Lists all configured LLM providers:
 
 | Column | Description |
 |--------|-------------|
-| **Name** | Unique provider name (e.g., "Claude", "GPT-5.3"). |
-| **Model** | Model identifier (e.g., `claude-sonnet-4-6`, `gpt-5.3-codex`). |
+| **Name** | Unique provider name (e.g., "Sonnet", "GPT"). |
+| **Model** | Exact model ID or installed tag exposed by the selected endpoint. |
 | **Type** | Provider type (see table below). |
 | **URL** | API endpoint URL. |
 | **Max Tokens** | Maximum tokens for requests. |
@@ -46,7 +48,7 @@ Controls the extended thinking budget for supported models:
 | **Medium** | ~10K tokens | Moderate reasoning for complex analysis. |
 | **High** | ~25K tokens | Deep reasoning for the most complex tasks. |
 
-Extended thinking is supported by Anthropic models (Claude) and OpenAI reasoning models (o1).
+Opus, Sonnet, GPT, and open-weight reasoning models may expose thinking controls, depending on the selected model and provider. Reasoning ability alone does not guarantee compatibility with this control. Leave **Reasoning Effort** at **None** when unsupported.
 
 ## Provider Types
 
@@ -68,7 +70,7 @@ When adding or editing a provider:
 |-------|-------------|
 | **Name** | Unique identifier for this provider. |
 | **Type** | Provider type from the table above. |
-| **Model** | Model ID (e.g., `claude-sonnet-4-6`, `gpt-4o`, `qwen2.5-coder:32b`). |
+| **Model** | Exact model ID, installed tag, or configured proxy alias. |
 | **URL** | API endpoint. Auto-filled for known provider types. |
 | **API Key** | Authentication credential. Encrypted in the settings database. |
 | **Max Tokens** | Maximum tokens per request. |

@@ -145,7 +145,7 @@ Configure reasoning depth in the Settings tab:
 | Medium | ~10K tokens | Moderate complexity, multi-step reasoning |
 | High | ~25K tokens | Deep analysis, complex vulnerability assessment |
 
-Higher thinking budgets produce more thorough responses but take longer. Extended thinking is supported by Anthropic Claude and OpenAI o1 models.
+Higher thinking budgets can produce more thorough responses but take longer. Opus, Sonnet, GPT, and open-weight reasoning models may expose thinking controls, depending on the selected model and provider. Leave **Reasoning Effort** at **None** when unsupported. See the [model guidance](../index.md#recommended-models) for current family recommendations and tool-calling requirements.
 
 ## Tips for Effective Queries
 
